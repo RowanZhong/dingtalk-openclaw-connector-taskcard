@@ -19,6 +19,7 @@ import { dingtalkPlugin, initDingtalkPluginConfigSchema } from "./src/channel.ts
 import { setDingtalkRuntime } from "./src/runtime.ts";
 import { registerGatewayMethods } from "./src/gateway-methods.ts";
 import { installDingtalkCardBridge, registerDingtalkCardGatewayMethods } from "./src/services/card-bridge.ts";
+import { registerTaskCardHooks } from "./src/task-card-hooks.ts";
 
 export { dingtalkPlugin, initDingtalkPluginConfigSchema } from "./src/channel.ts";
 export { setDingtalkRuntime } from "./src/runtime.ts";
@@ -75,6 +76,7 @@ export default function register(api: OpenClawPluginApi) {
   initDingtalkPluginConfigSchema();
   api.registerChannel({ plugin: dingtalkPlugin });
   registerGatewayMethods(api);
+  registerTaskCardHooks(api);
   installDingtalkCardBridge(api);
   registerDingtalkCardGatewayMethods(api);
 }
