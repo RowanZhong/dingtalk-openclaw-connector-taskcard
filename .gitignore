@@ -1,1 +1,3 @@
 *.tar.gz
+dingtalk-openclaw-connector/node_modules/
+dingtalk-openclaw-connector/coverage/
