@@ -249,6 +249,15 @@
               "markdown"
             ]
           },
+          "taskCard": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean" },
+              "watchdogMs": { "type": "number" }
+            }
+          },
+          "streaming": { "type": "boolean" },
           "accounts": {
             "type": "object",
             "additionalProperties": {
@@ -473,7 +482,16 @@
                     "text",
                     "markdown"
                   ]
-                }
+                },
+                "taskCard": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "watchdogMs": { "type": "number" }
+                  }
+                },
+                "streaming": { "type": "boolean" }
               },
               "additionalProperties": false
             }

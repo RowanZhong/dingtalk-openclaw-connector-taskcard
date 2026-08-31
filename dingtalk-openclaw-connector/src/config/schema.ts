@@ -40,6 +40,19 @@ const GroupReplyModeSchema = z
   .optional();
 
 /**
+ * 子代理任务卡配置。
+ * - enabled（默认 true）：openclaw 子代理模式下把 todo 进度与最终答案聚合到一张 AI 卡片
+ * - watchdogMs（默认 900000）：任务卡看门狗，无事件超时后强制收尾
+ */
+const TaskCardConfigSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    watchdogMs: z.number().int().positive().optional(),
+  })
+  .strict()
+  .optional();
+
+/**
  * Dingtalk tools configuration.
  * Controls which tool categories are enabled.
  */
@@ -85,6 +98,9 @@ const DingtalkSharedConfigShape = {
   enableMediaUpload: z.boolean().optional(),
   systemPrompt: z.string().optional(),
   groupReplyMode: GroupReplyModeSchema,
+  taskCard: TaskCardConfigSchema,
+  /** 是否启用 AI Card 流式（reply-dispatcher.ts:221 一直在读，此前 schema 漏声明） */
+  streaming: z.boolean().optional(),
 };
 
 /**
