@@ -52,6 +52,7 @@ import {
   emptyGroupReplyLogHint,
   groupChatLacksVisibleRepliesAutomatic,
 } from "./utils/empty-reply.ts";
+import { taskCardRegistry } from "./services/task-card.ts";
 
 
 export type CreateDingtalkReplyDispatcherParams = {
@@ -67,6 +68,8 @@ export type CreateDingtalkReplyDispatcherParams = {
   asyncMode?: boolean;
   /** 队列繁忙时预先创建的 AI Card，startStreaming 时直接复用而非新建 */
   preCreatedCard?: AICardInstance;
+  /** openclaw 会话键；提供后启用子代理任务卡（hook 事件按此键关联到本轮卡片） */
+  sessionKey?: string;
 };
 
 export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatcherParams) {
@@ -81,6 +84,7 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
     sessionWebhook,
     asyncMode = false,
     preCreatedCard,
+    sessionKey,
   } = params;
 
   const account = resolveDingtalkAccount({ cfg, accountId });
@@ -219,6 +223,16 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
 
   // 流式 AI Card 支持（text/markdown 模式强制禁用流式）
   const streamingEnabled = !isTextMode && (account.config as any)?.streaming !== false;
+  // 子代理任务卡：需要 sessionKey 且未显式关闭
+  const taskCardEnabled = Boolean(sessionKey) && (account.config as any)?.taskCard?.enabled !== false;
+  const bindTaskCard = (card: AICardInstance) => {
+    if (!taskCardEnabled) return;
+    const target: AICardTarget = isDirect
+      ? { type: 'user', userId: senderId }
+      : { type: 'group', openConversationId: conversationId };
+    taskCardRegistry.bind({ sessionKey: sessionKey!, target, card, config: account.config, log });
+  };
+  const inTaskCardMode = () => taskCardEnabled && taskCardRegistry.isOrchestrating(sessionKey!);
   // 用 Promise 保存 AI Card 的创建过程，避免 final 消息到达时轮询等待
   let cardCreationPromise: Promise<void> | null = null;
   // 回合 settle（onIdle）后置 true。openclaw 2026.5.x+ 存在 settle 之后仍会送达的
@@ -233,7 +247,8 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
   // watchdog 是最后防线：卡片创建后计时，流式更新/命令输出会刷新计时；
   // 到期仍未收口则强制 finishAICard 并密封本轮，之后迟到的 final/block
   // 走密封降级路径以普通消息发出，内容不丢失。
-  const CARD_WATCHDOG_TIMEOUT_MS = 10 * 60 * 1000;
+  const CARD_WATCHDOG_TIMEOUT_MS =
+    (account.config as any)?.taskCard?.watchdogMs ?? 10 * 60 * 1000;
   let cardWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
   let watchdogCard: AICardInstance | null = null;
   // 同一张卡片只允许一次 finish。入口 clearCardWatchdog 盖不到
@@ -275,6 +290,11 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
   };
 
   const forceFinishStaleCard = async () => {
+    if (inTaskCardMode()) {
+      log.info(`[TaskCard] dispatcher 看门狗触发但处于编排态，交由任务卡看门狗收尾`);
+      cardWatchdogTimer = null;
+      return;
+    }
     const staleCard = watchdogCard;
     cardWatchdogTimer = null;
     watchdogCard = null;
@@ -344,6 +364,7 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
         outboundUserVisibleThisTurn = true;
         watchdogCard = preCreatedCard;
         armCardWatchdog();
+        bindTaskCard(preCreatedCard);
         return;
       }
 
@@ -367,6 +388,7 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
         if (card) {
           watchdogCard = card;
           armCardWatchdog();
+          bindTaskCard(card);
           log.info(`[DingTalk][startStreaming] ✅ AI Card 创建成功`);
         } else {
           log.warn(`[DingTalk][startStreaming] AI Card 创建返回 null，静默降级到普通消息模式`);
@@ -578,6 +600,7 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
       // 正常收口完成，解除守护计时（若 watchdog 已先行触发则此处为幂等清理）
       clearCardWatchdog();
       accumulatedText = "";
+      if (taskCardEnabled) taskCardRegistry.release(sessionKey!);
     }
   };
 
@@ -765,6 +788,11 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
           log.info(`[DingTalk][deliver] block 消息，追加到流式 AI Card，文本长度=${text.length}`);
           // 确保 AI Card 已创建（startStreaming 内部会复用已有的 cardCreationPromise）
           await startStreaming();
+          if (inTaskCardMode()) {
+            await taskCardRegistry.setAnswer(sessionKey!, text);
+            outboundUserVisibleThisTurn = true;
+            return;
+          }
           // AI Card 已就绪，用 streamAICard 更新内容（仅展示当前 block 文本，不累积到 accumulatedText）
           // accumulatedText 专门给 onPartialReply 的流式更新使用，block 不能污染它
           if (currentCardTarget) {
@@ -798,6 +826,12 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
           log.info(`[DingTalk][deliver] final 响应，流式模式`);
           // await startStreaming() 确保 AI Card 创建完成后再处理 final
           await startStreaming();
+          if (inTaskCardMode()) {
+            deliveredFinalTexts.add(text);
+            await taskCardRegistry.setAnswer(sessionKey!, text);
+            outboundUserVisibleThisTurn = true;
+            return;
+          }
 
           if (currentCardTarget) {
             // 直接用 final 的 text 覆盖 accumulatedText，确保 closeStreaming 用最终内容关闭卡片
@@ -875,6 +909,10 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
         // 与 onIdle 对称：先密封再收口。onError 也是本轮的终结信号，
         // 收口后到达的迟到 onReplyStart / partial / block 不得再创建新卡片，
         // 否则同样会产生无人收口的孤儿卡（见 typing.ts 的 sealed 机制）。
+        if (taskCardEnabled && taskCardRegistry.onDispatchIdle(sessionKey!) === "keep-open") {
+          log.warn(`[TaskCard] 编排进行中遇到 onError，保持卡片打开等待子代理结果`);
+          return;
+        }
         streamingSealed = true;
         await closeStreaming();
         typingCallbacks.onIdle?.();
@@ -883,6 +921,10 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
       onIdle: async () => {
         log.info(`[DingTalk][onIdle] 回复空闲，关闭 AI Card`);
         typingCallbacks.onIdle?.();
+        if (taskCardEnabled && taskCardRegistry.onDispatchIdle(sessionKey!) === "keep-open") {
+          log.info(`[TaskCard] 编排进行中，onIdle 不收口不密封，等待子代理完成`);
+          return;
+        }
         // 先密封再收口：onIdle 意味着本轮 dispatcher 已 settle
         //（reservation 语义保证 onIdle 只在 markComplete 之后触发），
         // 此后任何迟到回调都不允许再创建新卡片。
@@ -926,6 +968,11 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
         await startStreaming();
         
         if (currentCardTarget) {
+          if (inTaskCardMode()) {
+            accumulatedText = payload.text;
+            await taskCardRegistry.setAnswer(sessionKey!, payload.text);
+            return;
+          }
           accumulatedText = payload.text;
           
           const now = Date.now();
