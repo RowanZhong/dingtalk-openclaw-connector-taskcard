@@ -123,17 +123,19 @@ type TaskCardState = {
 
 | # | 事件 | 来源 | Registry 动作 |
 |---|---|---|---|
-| 1 | 卡片创建成功 | `reply-dispatcher.startStreaming` | `bind(...)`，`phase="normal"`；若该 `sessionKey` 已有 `orchestrating` 记录则不注册（新卡由 dispatcher 按普通路径处理）。普通路径 finish 时调用 `release(sessionKey)` 移除 `normal` 记录 |
+| 1 | 卡片创建成功 | `reply-dispatcher.startStreaming` | `bind(...)` 返回是否注册成功，`phase="normal"`；若该 `sessionKey` 已有 `orchestrating` 记录且绑定的是另一张卡则拒绝注册并返回 `false`（新卡由 dispatcher 按普通路径处理，本轮不进入任务卡模式）。普通路径 finish 时调用 `release(sessionKey)` 移除 `normal` 记录 |
 | 2 | `before_tool_call`，`toolName==="sessions_spawn"` | hook，`ctx.sessionKey` | `markOrchestrating`：`phase="orchestrating"`，启动看门狗。必须在第 1 轮结束前发生，是阻止 finish 的唯一前置条件 |
 | 3 | `after_tool_call`，`toolName==="update_plan"` 且 `error` 为空 | hook，`event.params.plan` | `applyPlan`：整表替换 `steps`，按 step 文本保留已有 `childKey` 绑定；触发渲染 |
 | 4 | `subagent_spawned` | hook，`ctx.requesterSessionKey` | `onChildSpawned(childKey, label)`：`steps` 中存在 `step===label` 则绑定，否则追加 `{step: label, status: "in_progress"}`；若该 step 已为 `failed`（重试）则重置为 `in_progress`；触发渲染 |
 | 5 | 第 1 轮 `deliver(final)` / `onIdle` | dispatcher | `phase==="orchestrating"` → `setAnswer(text)` 并渲染，不 finish、不 seal；否则原逻辑 |
 | 6 | `subagent_ended` | hook，`targetSessionKey` | `onChildEnded(childKey, outcome)`：`done=true`；绑定 step 若为 `in_progress|pending` → `ok ? completed : failed`；触发渲染；随后检查 `isComplete` |
-| 7 | announce 轮 `sendText(to, text)` | `channel.ts` | 命中且 `phase==="orchestrating"` → `setAnswer(text)`；`isComplete()` ? `finish()` : 渲染。返回 `{ messageId: cardInstanceId, conversationId: to }` |
+| 7 | announce 轮 `sendText(to, text)` | `channel.ts` | 按 `${accountId}:${target}` 命中且 `phase==="orchestrating"` → 写入结果区（距上一次出站 < `OUTBOUND_CHUNK_WINDOW_MS`=1500ms 视为同一答案的后续分片，追加而非覆盖）；`isComplete()` 时把 `finish()` 推迟一个窗口（新分片到达则取消重排），否则渲染。返回 `{ messageId: cardInstanceId, conversationId: to }` |
 | 8 | `isComplete()` 为真（任何状态变更后检查） | 内部 | `finishAICard(render())`，`phase="finished"`，清看门狗，移除记录 |
 | 9 | 看门狗到期 | 内部 | `forceFinish()`：结果区追加提示后 `finishAICard`，移除记录 |
 
-`isComplete()` ≡ `answer` 非空 **且**（`steps` 非空且全为 `completed|failed`，**或** `steps` 为空且 `children` 非空且全 `done`）。
+`isComplete()` ≡ `answer` 非空 **且** `children` 非空且全部 `done` **且** 所有绑定了 `childKey` 的 step 均为 `completed|failed`。
+未绑定 `childKey` 的 step（编排协议强制放在末尾的「汇总结果」等，永远不会有 `subagent_spawned` 与之绑定）不参与完成判定；
+`finish()` 在渲染前把这些仍为 `pending|in_progress` 的未绑定 step 补标为 `completed`，否则卡片只能等看门狗超时。
 
 每个事件都刷新看门狗。
 
@@ -168,7 +170,7 @@ type TaskCardState = {
 | 最终答案早于最后一个 `subagent_ended` | `sendText` 时 `isComplete` 为假只写结果区；`onChildEnded` 后 `isComplete` 为真则由 Registry 主动 finish |
 | 中间轮 `NO_REPLY` | openclaw 出站前吞掉，`sendText` 不会被调用 |
 | `update_plan` 被 openclaw 校验拒绝 | `after_tool_call.error` 非空 → 忽略，保留上一版 `steps` |
-| `sessions_spawn` 被拒绝（allowAgents/深度/并发） | `onIdle` 时若 `children` 为空且 `steps` 无 `in_progress` → 回退普通收尾（finish），不留悬空卡 |
+| `sessions_spawn` 被拒绝（allowAgents/深度/并发） | `onIdle` 时若 `children` 为空 → 回退普通收尾（finish），不留悬空卡。不能再附加「`steps` 无 `in_progress`」条件：编排协议要求先把 step 标 `in_progress` 再 `spawn`，被拒时那条 `in_progress` 永远没人收尾 |
 | 卡片创建失败（返回 null） | 不 `bind`，所有 hook no-op，`sendText` 走原逻辑；接受降级，warn 一次 |
 | 流式接口错误 | 沿用 `streamAICard` 内部重试/刷 token；渲染失败只记日志，状态机不变；下次事件全量重推（`isFull:true` 幂等） |
 | 网关重启 | 内存状态丢失；旧卡由现有 `fixStuckCards` 人工收尾；不持久化 |
@@ -236,7 +238,7 @@ streaming: z.boolean().optional(),                       // 补声明：代码�
 | `src/services/task-card.ts`（新） | Registry + Renderer + 目标归一化复用 |
 | `src/task-card-hooks.ts`（新） | `registerTaskCardHooks(api)`：`before_tool_call`、`after_tool_call`、`subagent_spawned`、`subagent_ended` |
 | `index.ts` | 调用 `registerTaskCardHooks(api)` |
-| `src/reply-dispatcher.ts` | `startStreaming` 成功后 `bind`；普通路径 `closeStreaming` 后 `release`；`deliver(final)` 与 `onIdle` 增加编排态分支；看门狗时长改为读取 `taskCard.watchdogMs` |
+| `src/reply-dispatcher.ts` | `startStreaming` 成功后 `bind`（记录返回值，拒绝则本轮按普通卡片处理）；普通路径 `closeStreaming` 后 `release`；`deliver(final)` 与 `onIdle`/`onError` 增加编排态分支，keep-open 时解除 dispatcher 看门狗（收口所有权交给注册表看门狗）。dispatcher 看门狗仍为固定 10 分钟，`taskCard.watchdogMs` 只作用于注册表看门狗 |
 | `src/channel.ts` | `sendText` 增加注册表命中分支 |
 | `src/config/schema.ts`、`openclaw.plugin.json` | 新增 `taskCard`，补 `streaming` |
 

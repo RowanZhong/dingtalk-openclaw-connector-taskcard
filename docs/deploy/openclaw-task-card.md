@@ -23,8 +23,10 @@
   },
   channels: {
     "dingtalk-connector": {
-      // taskCard 默认开启；如需关闭或调整看门狗：
+      // taskCard 默认开启；如需关闭或调整任务卡看门狗（默认 15 分钟）：
       // taskCard: { enabled: true, watchdogMs: 900000 },
+      // 出站文本按 textChunkLimit 分片，调大可减少长答案被切片（默认 2000）：
+      // textChunkLimit: 8000,
     },
   },
 }
@@ -32,6 +34,17 @@
 
 注意：不要配置 `channels.dingtalk-connector.streaming.mode`（openclaw 内置渠道专用）；
 `agents.defaults.subagents` 是 strict schema，只接受上面列出的键。
+
+关于 `taskCard.watchdogMs`：只作用于任务卡注册表的看门狗（编排期间等待子代理的最长时间），
+不影响 reply-dispatcher 自身固定 10 分钟的卡片守护超时（后者只在非编排轮生效）。
+
+关于出站分片：openclaw 会把超过 `channels.dingtalk-connector.textChunkLimit`（插件声明默认 2000）
+的回复切成多次 `sendText`。任务卡把 1.5 秒窗口内到达的分片合并进同一张卡并推迟收尾，
+因此长答案不会分裂成多张卡；把 `textChunkLimit` 调大可以进一步减少分片。
+
+关于编排期间的出站文本：任务卡打开期间，**所有**发往该会话目标（同一 accountId + 同一用户/群）
+的出站文本都会被写进这张卡片，包括 message 工具主动发消息、定时任务与心跳提醒。
+如果不希望这些内容混入任务卡，请避免在编排进行中向同一目标推送无关消息。
 
 ## 2. 主控 agent workspace 的 AGENTS.md 编排协议
 
