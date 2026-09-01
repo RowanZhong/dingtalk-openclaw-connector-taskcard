@@ -22,15 +22,17 @@ const mockSendMarkdownMessage = vi.hoisted(() => vi.fn());
 const mockGetOapiAccessToken = vi.hoisted(() => vi.fn());
 const mockProcessLocalImages = vi.hoisted(() => vi.fn());
 
+const mockTypingCallbacks = vi.hoisted(() => ({
+  onActive: vi.fn(),
+  onIdle: vi.fn(),
+  onCleanup: vi.fn(),
+}));
+
 vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
   createReplyPrefixOptions: vi.fn(() => ({
     onModelSelected: vi.fn(),
   })),
-  createTypingCallbacks: vi.fn(() => ({
-    onActive: vi.fn(),
-    onIdle: vi.fn(),
-    onCleanup: vi.fn(),
-  })),
+  createTypingCallbacks: vi.fn(() => mockTypingCallbacks),
   logTypingFailure: vi.fn(),
 }));
 
@@ -88,7 +90,7 @@ vi.mock("../../src/utils/token.ts", () => ({
 }));
 
 const mockRegistry = vi.hoisted(() => ({
-  bind: vi.fn(),
+  bind: vi.fn(() => true),
   markOrchestrating: vi.fn(),
   isOrchestrating: vi.fn(() => false),
   applyPlan: vi.fn(),
@@ -155,6 +157,7 @@ describe("reply-dispatcher task card integration", () => {
     mockSendTextMessage.mockResolvedValue({ ok: true });
     mockSendMarkdownMessage.mockResolvedValue({ ok: true });
     mockIsQpsLimitError.mockReturnValue(false);
+    mockRegistry.bind.mockReturnValue(true);
     mockRegistry.isOrchestrating.mockReturnValue(false);
     mockRegistry.onDispatchIdle.mockReturnValue("not-orchestrating");
     mockRegistry.interceptOutboundText.mockResolvedValue({ handled: false });
@@ -239,6 +242,44 @@ describe("reply-dispatcher task card integration", () => {
     expect(mockRegistry.setAnswer).toHaveBeenCalledWith(expect.any(String), "叙述");
     expect(mockRegistry.setAnswer).toHaveBeenCalledWith(expect.any(String), "块文本");
     expect(mockStreamAICard).not.toHaveBeenCalled();   // 原始覆盖式推送被绕过
+  });
+
+  it("keep-open 交棒后 dispatcher 看门狗不得再收口 —— 否则注册表已发出的答案会被覆盖", async () => {
+    vi.useFakeTimers();
+    try {
+      let orchestrating = true;
+      mockRegistry.isOrchestrating.mockImplementation(() => orchestrating);
+      mockRegistry.onDispatchIdle.mockReturnValue("keep-open");
+      const { args } = await makeDispatcher();
+      await args.onReplyStart();
+      await vi.advanceTimersByTimeAsync(0);        // 卡片创建落地
+      expect(mockCreateAICardForTarget).toHaveBeenCalled();
+      await args.onIdle();                          // keep-open：卡片所有权交给注册表
+      orchestrating = false;                        // 注册表已收尾并移除记录（成功回合 < 10 分钟）
+      await vi.advanceTimersByTimeAsync(11 * 60 * 1000);
+      expect(mockFinishAICard).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("onError 的 keep-open 分支同样交棒且停止 typing —— 与 onIdle 对称", async () => {
+    vi.useFakeTimers();
+    try {
+      let orchestrating = true;
+      mockRegistry.isOrchestrating.mockImplementation(() => orchestrating);
+      mockRegistry.onDispatchIdle.mockReturnValue("keep-open");
+      const { args } = await makeDispatcher();
+      await args.onReplyStart();
+      await vi.advanceTimersByTimeAsync(0);
+      await args.onError(new Error("boom"), { kind: "final" });
+      expect(mockTypingCallbacks.onIdle).toHaveBeenCalled();   // 不能一直显示「正在输入」
+      orchestrating = false;
+      await vi.advanceTimersByTimeAsync(11 * 60 * 1000);
+      expect(mockFinishAICard).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("未传 sessionKey（旧调用方）时行为与 0.8.25 完全一致 —— 向后兼容", async () => {

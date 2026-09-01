@@ -329,8 +329,14 @@ export const dingtalkPlugin: ChannelPlugin<ResolvedDingtalkAccount> = {
     chunkerMode: "markdown",
     textChunkLimit: 2000,
     sendText: async ({ cfg, to, text, accountId, replyToId, threadId }) => {
-      // 子代理任务卡：announce 轮的最终答案写入既有卡片而非新建消息
-      const intercepted = await taskCardRegistry.interceptOutboundText({ to, text });
+      // 子代理任务卡：announce 轮的最终答案写入既有卡片而非新建消息。
+      // 注册表按 `${accountId}:${target}` 索引，故先解析账号（纯配置读取）。
+      const account = resolveDingtalkAccount({ cfg, accountId });
+      const intercepted = await taskCardRegistry.interceptOutboundText({
+        accountId: account.accountId,
+        to,
+        text,
+      });
       if (intercepted.handled) {
         return {
           channel: CHANNEL_ID,
@@ -338,7 +344,6 @@ export const dingtalkPlugin: ChannelPlugin<ResolvedDingtalkAccount> = {
           conversationId: to,
         };
       }
-      const account = resolveDingtalkAccount({ cfg, accountId });
       // 使用已解析的凭据覆盖原始 config，防止 clientId/clientSecret 为 SecretInput 对象或 undefined
       const resolvedConfig: DingtalkConfig = {
         ...account.config,

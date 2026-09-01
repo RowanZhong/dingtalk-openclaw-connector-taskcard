@@ -57,6 +57,12 @@ export function targetKey(target: AICardTarget): string {
 
 export const DEFAULT_TASK_WATCHDOG_MS = 900_000;
 export const RENDER_THROTTLE_MS = 800;
+/**
+ * openclaw 按 textChunkLimit 把长文本切成多次 sendText。窗口内到达的出站分片
+ * 视为同一条答案的续写（追加而非覆盖），并把收尾推迟到窗口关闭后，
+ * 否则第 1 片就 finish，第 2 片会另开一张普通卡。
+ */
+export const OUTBOUND_CHUNK_WINDOW_MS = 1500;
 const WATCHDOG_SUFFIX = "\n\n⚠️ 任务未在预期时间内完成，请重新发起或查看 /subagents";
 
 export type LoggerLike = {
@@ -89,19 +95,22 @@ type TaskCardRecord = {
   watchdogMs: number;
   watchdog?: ReturnType<typeof setTimeout>;
   renderTimer?: ReturnType<typeof setTimeout>;
+  finishTimer?: ReturnType<typeof setTimeout>;
   lastPushAt: number;
+  lastOutboundAt: number;
   finishing: boolean;
 };
 
 export type TaskCardRegistry = {
-  bind(p: { sessionKey: string; target: AICardTarget; card: AICardInstance; config: unknown; log?: LoggerLike }): void;
+  /** 返回是否注册成功；已有编排态记录且卡片不同时拒绝（调用方按普通卡片处理）。 */
+  bind(p: { sessionKey: string; accountId: string; target: AICardTarget; card: AICardInstance; config: unknown; log?: LoggerLike }): boolean;
   markOrchestrating(sessionKey: string): void;
   isOrchestrating(sessionKey: string): boolean;
   applyPlan(sessionKey: string, plan: Array<{ step?: unknown; status?: unknown }>): void;
   onChildSpawned(sessionKey: string, childKey: string, label?: string): void;
   onChildEnded(childKey: string, outcome?: string): void;
   setAnswer(sessionKey: string, text: string): Promise<void>;
-  interceptOutboundText(p: { to: string; text: string }): Promise<{ handled: boolean; cardInstanceId?: string }>;
+  interceptOutboundText(p: { accountId: string; to: string; text: string }): Promise<{ handled: boolean; cardInstanceId?: string }>;
   onDispatchIdle(sessionKey: string): "keep-open" | "not-orchestrating";
   release(sessionKey: string): void;
   reset(): void;
@@ -119,12 +128,13 @@ export function createTaskCardRegistry(depsIn?: Partial<TaskCardDeps>): TaskCard
   };
 
   const bySession = new Map<string, TaskCardRecord>();
-  const byTarget = new Map<string, string>();      // targetKey -> sessionKey
+  const byTarget = new Map<string, string>();      // `${accountId}:${targetKey}` -> sessionKey
   const byChild = new Map<string, string>();       // childSessionKey -> sessionKey
 
   const clearTimers = (rec: TaskCardRecord) => {
     if (rec.watchdog) { deps.clearTimeoutFn(rec.watchdog); rec.watchdog = undefined; }
     if (rec.renderTimer) { deps.clearTimeoutFn(rec.renderTimer); rec.renderTimer = undefined; }
+    if (rec.finishTimer) { deps.clearTimeoutFn(rec.finishTimer); rec.finishTimer = undefined; }
   };
 
   const remove = (rec: TaskCardRecord) => {
@@ -134,15 +144,14 @@ export function createTaskCardRegistry(depsIn?: Partial<TaskCardDeps>): TaskCard
     for (const [child, owner] of byChild) if (owner === rec.sessionKey) byChild.delete(child);
   };
 
+  // 编排协议强制在计划末尾放一条不会 spawn 子代理的「汇总结果」，它永远
+  // 停在 pending/in_progress。因此完成判定只看真正有子代理绑定的步骤，
+  // 未绑定的残留步骤在 finish 时补标完成。
   const isComplete = (rec: TaskCardRecord): boolean => {
     if (!rec.answer.trim()) return false;
-    if (rec.steps.length > 0) {
-      return rec.steps.every((s) => s.status === "completed" || s.status === "failed");
-    }
-    if (rec.children.size > 0) {
-      return [...rec.children.values()].every((c) => c.done);
-    }
-    return false;
+    if (rec.children.size === 0) return false;
+    if (![...rec.children.values()].every((c) => c.done)) return false;
+    return rec.steps.every((s) => !s.childKey || s.status === "completed" || s.status === "failed");
   };
 
   const push = async (rec: TaskCardRecord) => {
@@ -169,6 +178,10 @@ export function createTaskCardRegistry(depsIn?: Partial<TaskCardDeps>): TaskCard
     if (rec.finishing) return;
     rec.finishing = true;
     clearTimers(rec);
+    // 未绑定子代理的残留步骤（如协议强制的「汇总结果」）在收尾时补标完成
+    for (const s of rec.steps) {
+      if (!s.childKey && (s.status === "pending" || s.status === "in_progress")) s.status = "completed";
+    }
     const { card, config } = rec;
     remove(rec);
     if (card && config) {
@@ -217,6 +230,7 @@ export function createTaskCardRegistry(depsIn?: Partial<TaskCardDeps>): TaskCard
         answer: "",
         watchdogMs: DEFAULT_TASK_WATCHDOG_MS,
         lastPushAt: 0,
+        lastOutboundAt: 0,
         finishing: false,
       };
       bySession.set(sessionKey, rec);
@@ -227,14 +241,23 @@ export function createTaskCardRegistry(depsIn?: Partial<TaskCardDeps>): TaskCard
   return {
     bind(p) {
       const rec = getOrCreate(p.sessionKey);
+      // 编排进行中的任务卡不得被同 session 的新一轮卡片顶替：否则旧卡永远
+      // 不收尾，新一轮的输出还会被写进旧卡。此时拒绝注册，新卡走普通路径。
+      if (rec.phase === "orchestrating" && rec.card && rec.card.cardInstanceId !== p.card.cardInstanceId) {
+        (p.log ?? rec.log)?.info?.(
+          `[TaskCard] 已有编排中的任务卡 card=${rec.card.cardInstanceId}，拒绝注册新卡 card=${p.card.cardInstanceId}`,
+        );
+        return false;
+      }
       rec.card = p.card;
       rec.config = p.config;
       rec.log = p.log;
-      rec.tKey = targetKey(p.target);
+      rec.tKey = `${p.accountId}:${targetKey(p.target)}`;
       byTarget.set(rec.tKey, p.sessionKey);
       const configured = (p.config as { taskCard?: { watchdogMs?: number } } | undefined)?.taskCard?.watchdogMs;
       if (typeof configured === "number" && configured > 0) rec.watchdogMs = configured;
       if (rec.phase === "orchestrating") touchWatchdog(rec);
+      return true;
     },
     markOrchestrating(sessionKey) {
       const rec = getOrCreate(sessionKey);
@@ -280,11 +303,13 @@ export function createTaskCardRegistry(depsIn?: Partial<TaskCardDeps>): TaskCard
       if (!sessionKey) return;
       const rec = bySession.get(sessionKey);
       if (!rec) return;
+      // outcome 缺省（openclaw 正常结束事件可能不带该字段）按成功处理
+      const ok = outcome === undefined || outcome === "ok";
       const child = rec.children.get(childKey);
-      if (child) { child.done = true; child.ok = outcome === "ok"; }
+      if (child) { child.done = true; child.ok = ok; }
       const step = rec.steps.find((s) => s.childKey === childKey);
       if (step && (step.status === "pending" || step.status === "in_progress")) {
-        step.status = outcome === "ok" ? "completed" : "failed";
+        step.status = ok ? "completed" : "failed";
       }
       void afterMutation(rec);
     },
@@ -293,22 +318,40 @@ export function createTaskCardRegistry(depsIn?: Partial<TaskCardDeps>): TaskCard
       if (!rec || rec.phase !== "orchestrating") return;
       await applyAnswer(rec, text);
     },
-    async interceptOutboundText({ to, text }) {
+    async interceptOutboundText({ accountId, to, text }) {
       const target = normalizeOutboundTarget(to);
       if (!target) return { handled: false };
-      const sessionKey = byTarget.get(targetKey(target));
+      const sessionKey = byTarget.get(`${accountId}:${targetKey(target)}`);
       if (!sessionKey) return { handled: false };
       const rec = bySession.get(sessionKey);
       if (!rec || rec.phase !== "orchestrating" || !rec.card || !rec.config) return { handled: false };
       const cardInstanceId = rec.card.cardInstanceId;
-      await applyAnswer(rec, text);
+      const at = deps.now();
+      // 窗口内的后续分片是同一条答案的续写，追加而不是覆盖
+      rec.answer = rec.lastOutboundAt > 0 && at - rec.lastOutboundAt < OUTBOUND_CHUNK_WINDOW_MS && rec.answer
+        ? `${rec.answer}\n${text}`
+        : text;
+      rec.lastOutboundAt = at;
+      if (rec.finishTimer) { deps.clearTimeoutFn(rec.finishTimer); rec.finishTimer = undefined; }
+      touchWatchdog(rec);
+      if (isComplete(rec)) {
+        // 收尾推迟一个窗口：后续分片会取消并重排这个定时器
+        rec.finishTimer = deps.setTimeoutFn(() => {
+          rec.finishTimer = undefined;
+          void finish(rec);
+        }, OUTBOUND_CHUNK_WINDOW_MS);
+        (rec.finishTimer as { unref?: () => void }).unref?.();
+      } else {
+        scheduleRender(rec);
+      }
       return { handled: true, cardInstanceId };
     },
     onDispatchIdle(sessionKey) {
       const rec = bySession.get(sessionKey);
       if (!rec || rec.phase !== "orchestrating") return "not-orchestrating";
-      const hasInProgress = rec.steps.some((s) => s.status === "in_progress");
-      if (rec.children.size === 0 && !hasInProgress) {
+      // 只看是否真的有子代理：协议要求先把 step 标 in_progress 再 spawn，
+      // spawn 被拒时那个 in_progress 永远不会有人收尾。
+      if (rec.children.size === 0) {
         rec.phase = "normal";       // 降级：spawn 从未成功，交回 dispatcher 正常收尾
         clearTimers(rec);
         return "not-orchestrating";

@@ -225,14 +225,24 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
   const streamingEnabled = !isTextMode && (account.config as any)?.streaming !== false;
   // 子代理任务卡：需要 sessionKey 且未显式关闭
   const taskCardEnabled = Boolean(sessionKey) && (account.config as any)?.taskCard?.enabled !== false;
-  const bindTaskCard = (card: AICardInstance) => {
-    if (!taskCardEnabled) return;
+  // 本轮的卡片是否真的注册进了任务卡注册表。注册表可能拒绝（同 session 已有
+  // 编排中的任务卡），此时本轮必须完全走 0.8.25 的普通卡片路径。
+  let taskCardBound = false;
+  const bindTaskCard = (card: AICardInstance): boolean => {
+    if (!taskCardEnabled) return false;
     const target: AICardTarget = isDirect
       ? { type: 'user', userId: senderId }
       : { type: 'group', openConversationId: conversationId };
-    taskCardRegistry.bind({ sessionKey: sessionKey!, target, card, config: account.config, log });
+    return taskCardRegistry.bind({
+      sessionKey: sessionKey!,
+      accountId: account.accountId,
+      target,
+      card,
+      config: account.config,
+      log,
+    });
   };
-  const inTaskCardMode = () => taskCardEnabled && taskCardRegistry.isOrchestrating(sessionKey!);
+  const inTaskCardMode = () => taskCardBound && taskCardRegistry.isOrchestrating(sessionKey!);
   // 用 Promise 保存 AI Card 的创建过程，避免 final 消息到达时轮询等待
   let cardCreationPromise: Promise<void> | null = null;
   // 回合 settle（onIdle）后置 true。openclaw 2026.5.x+ 存在 settle 之后仍会送达的
@@ -247,8 +257,8 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
   // watchdog 是最后防线：卡片创建后计时，流式更新/命令输出会刷新计时；
   // 到期仍未收口则强制 finishAICard 并密封本轮，之后迟到的 final/block
   // 走密封降级路径以普通消息发出，内容不丢失。
-  const CARD_WATCHDOG_TIMEOUT_MS =
-    (account.config as any)?.taskCard?.watchdogMs ?? 10 * 60 * 1000;
+  // taskCard.watchdogMs 只作用于任务卡注册表的看门狗，dispatcher 这条固定 10 分钟
+  const CARD_WATCHDOG_TIMEOUT_MS = 10 * 60 * 1000;
   let cardWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
   let watchdogCard: AICardInstance | null = null;
   // 同一张卡片只允许一次 finish。入口 clearCardWatchdog 盖不到
@@ -293,6 +303,7 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
     if (inTaskCardMode()) {
       log.info(`[TaskCard] dispatcher 看门狗触发但处于编排态，交由任务卡看门狗收尾`);
       cardWatchdogTimer = null;
+      watchdogCard = null;
       return;
     }
     const staleCard = watchdogCard;
@@ -316,6 +327,7 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
       log.error(`[DingTalk][cardWatchdog] ❌ 强制收口失败：${err?.message || String(err)}`);
     } finally {
       accumulatedText = "";
+      if (taskCardBound) taskCardRegistry.release(sessionKey!);
     }
   };
 
@@ -364,7 +376,7 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
         outboundUserVisibleThisTurn = true;
         watchdogCard = preCreatedCard;
         armCardWatchdog();
-        bindTaskCard(preCreatedCard);
+        taskCardBound = bindTaskCard(preCreatedCard);
         return;
       }
 
@@ -388,7 +400,7 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
         if (card) {
           watchdogCard = card;
           armCardWatchdog();
-          bindTaskCard(card);
+          taskCardBound = bindTaskCard(card);
           log.info(`[DingTalk][startStreaming] ✅ AI Card 创建成功`);
         } else {
           log.warn(`[DingTalk][startStreaming] AI Card 创建返回 null，静默降级到普通消息模式`);
@@ -600,7 +612,7 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
       // 正常收口完成，解除守护计时（若 watchdog 已先行触发则此处为幂等清理）
       clearCardWatchdog();
       accumulatedText = "";
-      if (taskCardEnabled) taskCardRegistry.release(sessionKey!);
+      if (taskCardBound) taskCardRegistry.release(sessionKey!);
     }
   };
 
@@ -909,8 +921,12 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
         // 与 onIdle 对称：先密封再收口。onError 也是本轮的终结信号，
         // 收口后到达的迟到 onReplyStart / partial / block 不得再创建新卡片，
         // 否则同样会产生无人收口的孤儿卡（见 typing.ts 的 sealed 机制）。
-        if (taskCardEnabled && taskCardRegistry.onDispatchIdle(sessionKey!) === "keep-open") {
+        if (taskCardBound && taskCardRegistry.onDispatchIdle(sessionKey!) === "keep-open") {
           log.warn(`[TaskCard] 编排进行中遇到 onError，保持卡片打开等待子代理结果`);
+          // 卡片所有权交给注册表看门狗：dispatcher 这条 10 分钟定时器若继续存在，
+          // 会在注册表收尾后回头用旧文本再 finish 一次，覆盖已发出的答案。
+          clearCardWatchdog();
+          typingCallbacks.onIdle?.();
           return;
         }
         streamingSealed = true;
@@ -921,8 +937,10 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
       onIdle: async () => {
         log.info(`[DingTalk][onIdle] 回复空闲，关闭 AI Card`);
         typingCallbacks.onIdle?.();
-        if (taskCardEnabled && taskCardRegistry.onDispatchIdle(sessionKey!) === "keep-open") {
+        if (taskCardBound && taskCardRegistry.onDispatchIdle(sessionKey!) === "keep-open") {
           log.info(`[TaskCard] 编排进行中，onIdle 不收口不密封，等待子代理完成`);
+          // 同上：交棒给注册表看门狗，解除 dispatcher 侧的强制收口
+          clearCardWatchdog();
           return;
         }
         // 先密封再收口：onIdle 意味着本轮 dispatcher 已 settle
