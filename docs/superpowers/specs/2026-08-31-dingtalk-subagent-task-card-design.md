@@ -133,7 +133,7 @@ type TaskCardState = {
 | 8 | `isComplete()` 为真（任何状态变更后检查） | 内部 | `finishAICard(render())`，`phase="finished"`，清看门狗，移除记录 |
 | 9 | 看门狗到期 | 内部 | `forceFinish()`：结果区追加提示后 `finishAICard`，移除记录 |
 
-`isComplete()` ≡ `answer` 非空 **且** `children` 非空且全部 `done` **且** 所有绑定了 `childKey` 的 step 均为 `completed|failed`。
+`isComplete()` ≡ `answer` 非空 **且** `children` 非空且每个子代理已 settled（`done`，**或**其绑定 step 已被 `update_plan` 标为 `completed|failed`——因 openclaw 会把 `subagent_ended` 推迟到 announce 之后，见 §6）**且** 所有带 `childKey` 的 step 为 `completed|failed`。`finish` 时把仍为 `pending|in_progress` 的未绑定 step 标记为 `completed` 后渲染。
 未绑定 `childKey` 的 step（编排协议强制放在末尾的「汇总结果」等，永远不会有 `subagent_spawned` 与之绑定）不参与完成判定；
 `finish()` 在渲染前把这些仍为 `pending|in_progress` 的未绑定 step 补标为 `completed`，否则卡片只能等看门狗超时。
 
@@ -169,7 +169,7 @@ type TaskCardState = {
 | 看门狗到期（默认 15 分钟无事件） | `forceFinish`：结果区追加「⚠️ 任务未在预期时间内完成，请重新发起或查看 /subagents」，finish，移除 |
 | 最终答案早于最后一个 `subagent_ended` | `sendText` 时 `isComplete` 为假只写结果区；`onChildEnded` 后 `isComplete` 为真则由 Registry 主动 finish |
 | 中间轮 `NO_REPLY` | openclaw 出站前吞掉，`sendText` 不会被调用 |
-| 子代理完成事件被 steer 进用户的活跃轮（最终答案经该轮 `deliver(final)` 送达） | openclaw 会把 `subagent_ended` hook 推迟到 announce 投递/清理之后，所以该 final 早于 `onChildEnded`。`isComplete` 对未 `done` 的子代理接受其绑定步骤已被 `update_plan` 标为终态作为完成信号；dispatcher 在本轮非任务卡时调用 `tryCompleteWithFinal`，可收尾则接管并 finish，否则丢弃该文本（侧问题回复不得进入任务卡）。残余：若主控未按协议调用 `update_plan`，该 final 会被丢弃，任务卡等待后续 announce 经 `sendText` 送达或看门狗收尾 |
+| 子代理完成事件被 steer 进用户的活跃轮（最终答案经该轮 `deliver(final)` 送达） | openclaw 会把 `subagent_ended` hook 推迟到 announce 投递/清理之后，所以该 final 早于 `onChildEnded`。`isComplete` 对未 `done` 的子代理接受其绑定步骤已被 `update_plan` 标为终态作为完成信号；dispatcher 在本轮非任务卡时调用 `tryCompleteWithFinal`，可收尾则接管并 finish，否则丢弃该文本（侧问题回复不得进入任务卡）。残余：若主控未按协议调用 `update_plan`，该 final 会被丢弃，任务卡等待后续 announce 经 `sendText` 送达或看门狗收尾；反向残余：若主控在子代理实际未结束时就把步骤标为终态（过报），随后到达的 final 会提前收尾，该子代理之后的 `subagent_ended`/输出对已移除记录为 no-op |
 | `update_plan` 被 openclaw 校验拒绝 | `after_tool_call.error` 非空 → 忽略，保留上一版 `steps` |
 | `sessions_spawn` 被拒绝（allowAgents/深度/并发） | `onIdle` 时若 `children` 为空 → 回退普通收尾（finish），不留悬空卡。不能再附加「`steps` 无 `in_progress`」条件：编排协议要求先把 step 标 `in_progress` 再 `spawn`，被拒时那条 `in_progress` 永远没人收尾 |
 | 卡片创建失败（返回 null） | 不 `bind`，所有 hook no-op，`sendText` 走原逻辑；接受降级，warn 一次 |
