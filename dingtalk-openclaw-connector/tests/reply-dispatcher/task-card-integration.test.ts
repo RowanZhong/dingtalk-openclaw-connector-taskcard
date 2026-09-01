@@ -91,6 +91,7 @@ vi.mock("../../src/utils/token.ts", () => ({
 
 const mockRegistry = vi.hoisted(() => ({
   bind: vi.fn(() => true),
+  tryCompleteWithFinal: vi.fn(async () => false),
   markOrchestrating: vi.fn(),
   isOrchestrating: vi.fn(() => false),
   applyPlan: vi.fn(),
@@ -161,6 +162,7 @@ describe("reply-dispatcher task card integration", () => {
     mockRegistry.isOrchestrating.mockReturnValue(false);
     mockRegistry.onDispatchIdle.mockReturnValue("not-orchestrating");
     mockRegistry.interceptOutboundText.mockResolvedValue({ handled: false });
+    mockRegistry.tryCompleteWithFinal.mockResolvedValue(false);
     mockCreateReplyDispatcherWithTyping.mockImplementation((args: any) => {
       (globalThis as any).__dispatcherArgs = args;
       return {
@@ -289,5 +291,30 @@ describe("reply-dispatcher task card integration", () => {
     await args.deliver({ text: "答案" }, { kind: "final" });
     expect(mockFinishAICard).toHaveBeenCalled();
     expect(mockRegistry.bind).not.toHaveBeenCalled();
+  });
+  it("本轮不是任务卡但会话的任务卡可收尾时，final 同时写入任务卡并照常关闭本轮卡片 —— steer 进活跃轮的最终答案不丢", async () => {
+    mockRegistry.bind.mockReturnValue(false);            // 任务卡已被上一轮占用，本轮 bind 被拒
+    mockRegistry.isOrchestrating.mockReturnValue(true);
+    mockRegistry.tryCompleteWithFinal.mockResolvedValue(true);
+    const { args } = await makeDispatcher();
+    await args.onReplyStart();
+    await vi.waitFor(() => expect(mockCreateAICardForTarget).toHaveBeenCalled());
+    await args.deliver({ text: "最终答案" }, { kind: "final" });
+    expect(mockRegistry.tryCompleteWithFinal).toHaveBeenCalledWith(
+      "agent:main:dingtalk-connector:dm:user-1",
+      "最终答案",
+    );
+    expect(mockRegistry.setAnswer).not.toHaveBeenCalled();
+    expect(mockFinishAICard).toHaveBeenCalledTimes(1);   // 本轮普通卡照常关闭，不留孤儿卡
+  });
+
+  it("本轮自身就是任务卡时不调用 tryCompleteWithFinal（走 setAnswer 路径）", async () => {
+    mockRegistry.isOrchestrating.mockReturnValue(true);
+    const { args } = await makeDispatcher();
+    await args.onReplyStart();
+    await vi.waitFor(() => expect(mockCreateAICardForTarget).toHaveBeenCalled());
+    await args.deliver({ text: "答案" }, { kind: "final" });
+    expect(mockRegistry.tryCompleteWithFinal).not.toHaveBeenCalled();
+    expect(mockRegistry.setAnswer).toHaveBeenCalled();
   });
 });

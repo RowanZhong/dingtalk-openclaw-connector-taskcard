@@ -205,4 +205,38 @@ describe("TaskCardRegistry", () => {
     expect(streamAICard).toHaveBeenCalled();
     expect(registry.isOrchestrating(KEY)).toBe(true);
   });
+  it("tryCompleteWithFinal：子代理未全部完成时不接管 final —— answer 不变、不 finish", async () => {
+    const { registry, finishAICard } = make();
+    registry.bind({ sessionKey: KEY, accountId: ACC, target: TARGET, card: CARD, config: CFG });
+    registry.markOrchestrating(KEY);
+    registry.onChildSpawned(KEY, "child-1", "任务A");
+    expect(await registry.tryCompleteWithFinal(KEY, "答案")).toBe(false);
+    expect(finishAICard).not.toHaveBeenCalled();
+    expect(registry.isOrchestrating(KEY)).toBe(true);
+  });
+
+  it("tryCompleteWithFinal：子代理全部完成时接管 final 并立即收尾 —— steer 进活跃轮的最终答案落回任务卡", async () => {
+    const { registry, finishAICard } = make();
+    registry.bind({ sessionKey: KEY, accountId: ACC, target: TARGET, card: CARD, config: CFG });
+    registry.markOrchestrating(KEY);
+    registry.onChildSpawned(KEY, "child-1", "任务A");
+    registry.onChildEnded("child-1", "ok");
+    expect(await registry.tryCompleteWithFinal(KEY, "最终答案")).toBe(true);
+    expect(finishAICard).toHaveBeenCalledTimes(1);
+    const md = finishAICard.mock.calls[0][1] as string;
+    expect(md).toContain("✅ 任务A");
+    expect(md).toContain("最终答案");
+    expect(registry.isOrchestrating(KEY)).toBe(false);
+  });
+
+  it("tryCompleteWithFinal：非编排态或空文本返回 false", async () => {
+    const { registry, finishAICard } = make();
+    expect(await registry.tryCompleteWithFinal(KEY, "x")).toBe(false);
+    registry.bind({ sessionKey: KEY, accountId: ACC, target: TARGET, card: CARD, config: CFG });
+    registry.markOrchestrating(KEY);
+    registry.onChildSpawned(KEY, "child-1", "任务A");
+    registry.onChildEnded("child-1", "ok");
+    expect(await registry.tryCompleteWithFinal(KEY, "   ")).toBe(false);
+    expect(finishAICard).not.toHaveBeenCalled();
+  });
 });

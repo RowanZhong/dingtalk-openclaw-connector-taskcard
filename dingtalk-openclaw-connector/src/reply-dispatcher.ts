@@ -844,6 +844,12 @@ export function createDingtalkReplyDispatcher(params: CreateDingtalkReplyDispatc
             outboundUserVisibleThisTurn = true;
             return;
           }
+          // 本轮不是任务卡（bind 被拒/创建失败），但会话里编排中的任务卡此刻已可收尾：
+          // 子代理完成事件被 steer 进本轮时，最终答案会经本轮 final 送达，必须同时落回任务卡；
+          // 本轮自己的卡片照常关闭，避免留下孤儿卡
+          if (taskCardEnabled && !taskCardBound && await taskCardRegistry.tryCompleteWithFinal(sessionKey!, text)) {
+            log.info(`[TaskCard] 本轮 final 已同步写入任务卡并收尾，本轮卡片照常关闭`);
+          }
 
           if (currentCardTarget) {
             // 直接用 final 的 text 覆盖 accumulatedText，确保 closeStreaming 用最终内容关闭卡片

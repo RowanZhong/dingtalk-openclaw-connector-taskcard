@@ -110,6 +110,8 @@ export type TaskCardRegistry = {
   onChildSpawned(sessionKey: string, childKey: string, label?: string): void;
   onChildEnded(childKey: string, outcome?: string): void;
   setAnswer(sessionKey: string, text: string): Promise<void>;
+  /** 本轮不是任务卡时：若会话的任务卡此刻已可收尾（子代理全部完成），接管 final 文本并立即收尾；返回是否接管。 */
+  tryCompleteWithFinal(sessionKey: string, text: string): Promise<boolean>;
   interceptOutboundText(p: { accountId: string; to: string; text: string }): Promise<{ handled: boolean; cardInstanceId?: string }>;
   onDispatchIdle(sessionKey: string): "keep-open" | "not-orchestrating";
   release(sessionKey: string): void;
@@ -317,6 +319,22 @@ export function createTaskCardRegistry(depsIn?: Partial<TaskCardDeps>): TaskCard
       const rec = bySession.get(sessionKey);
       if (!rec || rec.phase !== "orchestrating") return;
       await applyAnswer(rec, text);
+    },
+    async tryCompleteWithFinal(sessionKey, text) {
+      const rec = bySession.get(sessionKey);
+      if (!rec || rec.phase !== "orchestrating" || !rec.card || !rec.config) return false;
+      if (!text.trim()) return false;
+      // 子代理完成事件被 steer 进活跃轮时，最终答案经该轮 final 送达；只有此刻确实可收尾才接管
+      const previous = rec.answer;
+      rec.answer = text;
+      if (!isComplete(rec)) {
+        rec.answer = previous;
+        return false;
+      }
+      if (rec.finishTimer) { deps.clearTimeoutFn(rec.finishTimer); rec.finishTimer = undefined; }
+      rec.log?.info?.(`[TaskCard] 活跃轮的 final 落回任务卡并收尾 session=${sessionKey}`);
+      await finish(rec);
+      return true;
     },
     async interceptOutboundText({ accountId, to, text }) {
       const target = normalizeOutboundTarget(to);

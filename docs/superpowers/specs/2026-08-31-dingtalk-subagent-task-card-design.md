@@ -159,7 +159,7 @@ type TaskCardState = {
 ### 顺序与并发
 
 - 事件 2 早于事件 5：`before_tool_call` 在工具执行前被 await，`final`/`onIdle` 在 `sessions_yield` 之后才到。
-- 同一 session 编排期间收到用户新消息：新 dispatch 走普通卡片且不进入注册表（`bind` 发现已有 orchestrating 记录即跳过），任务卡继续独立收尾。期间再次 `sessions_spawn` 触发的 `markOrchestrating` 命中现有记录，步骤并入现有任务卡。
+- 同一 session 编排期间收到用户新消息：新 dispatch 走普通卡片且不进入注册表（`bind` 发现已有 orchestrating 记录即跳过），任务卡继续独立收尾。期间再次 `sessions_spawn` 触发的 `markOrchestrating` 命中现有记录，步骤并入现有任务卡。若子代理完成事件恰在这一活跃轮进行中到达，openclaw 会把它 steer 进该轮，最终答案经该轮的 `deliver(final)` 送达：dispatcher 在本轮非任务卡时调用 `tryCompleteWithFinal(sessionKey, text)`，任务卡此刻可收尾（子代理全部完成）则接管该文本并 finish，本轮普通卡照常关闭。
 
 ## 6. 异常处理
 
