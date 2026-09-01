@@ -50,6 +50,15 @@
 
 ---
 
+## 🗂️ 子代理任务卡（fork 增强）
+
+openclaw 子代理模式（`sessions_spawn`）下，一条指令只产生一张 AI 卡片：上半部分实时展示
+`update_plan` 维护的 todo list（⏳/🔄/✅/❌），全部子任务完成后同一张卡下半部分展示最终答案。
+配置：`channels.dingtalk-connector.taskCard: { enabled?: boolean, watchdogMs?: number }`（默认开启，
+看门狗 15 分钟）。openclaw 侧配置与主控编排协议见仓库根 `docs/deploy/openclaw-task-card.md`。
+
+---
+
 ## 安全与风险提示（使用前必读）
 
 本插件对接 OpenClaw AI 自动化能力，存在模型幻觉、执行不可控、提示词注入等固有风险。授权钉钉权限后，OpenClaw 将以你的用户身份在授权范围内执行操作，可能导致敏感数据泄露或越权操作等高风险后果，请谨慎使用。
