@@ -239,4 +239,38 @@ describe("TaskCardRegistry", () => {
     expect(await registry.tryCompleteWithFinal(KEY, "   ")).toBe(false);
     expect(finishAICard).not.toHaveBeenCalled();
   });
+  it("subagent_ended 被 openclaw 推迟到 announce 之后：update_plan 已标终态的步骤视为完成 —— steer 进活跃轮的 final 不被丢弃", async () => {
+    const { registry, finishAICard } = make();
+    registry.bind({ sessionKey: KEY, accountId: ACC, target: TARGET, card: CARD, config: CFG });
+    registry.markOrchestrating(KEY);
+    registry.applyPlan(KEY, [{ step: "任务A", status: "in_progress" }]);
+    registry.onChildSpawned(KEY, "child-1", "任务A");
+    // 子代理实际已结束，但 hook 尚未触发；主控按协议先 update_plan 标 completed，再输出 final
+    registry.applyPlan(KEY, [{ step: "任务A", status: "completed" }]);
+    expect(await registry.tryCompleteWithFinal(KEY, "最终答案")).toBe(true);
+    expect(finishAICard).toHaveBeenCalledTimes(1);
+    expect(finishAICard.mock.calls[0][1]).toContain("最终答案");
+    // 迟到的 subagent_ended 对已移除的记录是 no-op，不会二次 finish
+    registry.onChildEnded("child-1", "ok");
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(finishAICard).toHaveBeenCalledTimes(1);
+  });
+
+  it("侧问题回复（步骤未终态、子代理未结束）被拒后，卡片仍等待真正的最终答案经 sendText 到达", async () => {
+    const { registry, finishAICard } = make();
+    registry.bind({ sessionKey: KEY, accountId: ACC, target: TARGET, card: CARD, config: CFG });
+    registry.markOrchestrating(KEY);
+    registry.applyPlan(KEY, [{ step: "任务A", status: "in_progress" }]);
+    registry.onChildSpawned(KEY, "child-1", "任务A");
+    expect(await registry.tryCompleteWithFinal(KEY, "进展：还在跑")).toBe(false);
+    registry.onChildEnded("child-1", "ok");
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(finishAICard).not.toHaveBeenCalled();          // 侧问题回复没有被当成答案
+    expect(registry.isOrchestrating(KEY)).toBe(true);
+    const r = await registry.interceptOutboundText({ accountId: ACC, to: "u1", text: "真正的最终答案" });
+    expect(r.handled).toBe(true);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(finishAICard).toHaveBeenCalledTimes(1);
+    expect(finishAICard.mock.calls[0][1]).toContain("真正的最终答案");
+  });
 });

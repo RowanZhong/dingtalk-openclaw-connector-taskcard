@@ -169,6 +169,7 @@ type TaskCardState = {
 | 看门狗到期（默认 15 分钟无事件） | `forceFinish`：结果区追加「⚠️ 任务未在预期时间内完成，请重新发起或查看 /subagents」，finish，移除 |
 | 最终答案早于最后一个 `subagent_ended` | `sendText` 时 `isComplete` 为假只写结果区；`onChildEnded` 后 `isComplete` 为真则由 Registry 主动 finish |
 | 中间轮 `NO_REPLY` | openclaw 出站前吞掉，`sendText` 不会被调用 |
+| 子代理完成事件被 steer 进用户的活跃轮（最终答案经该轮 `deliver(final)` 送达） | openclaw 会把 `subagent_ended` hook 推迟到 announce 投递/清理之后，所以该 final 早于 `onChildEnded`。`isComplete` 对未 `done` 的子代理接受其绑定步骤已被 `update_plan` 标为终态作为完成信号；dispatcher 在本轮非任务卡时调用 `tryCompleteWithFinal`，可收尾则接管并 finish，否则丢弃该文本（侧问题回复不得进入任务卡）。残余：若主控未按协议调用 `update_plan`，该 final 会被丢弃，任务卡等待后续 announce 经 `sendText` 送达或看门狗收尾 |
 | `update_plan` 被 openclaw 校验拒绝 | `after_tool_call.error` 非空 → 忽略，保留上一版 `steps` |
 | `sessions_spawn` 被拒绝（allowAgents/深度/并发） | `onIdle` 时若 `children` 为空 → 回退普通收尾（finish），不留悬空卡。不能再附加「`steps` 无 `in_progress`」条件：编排协议要求先把 step 标 `in_progress` 再 `spawn`，被拒时那条 `in_progress` 永远没人收尾 |
 | 卡片创建失败（返回 null） | 不 `bind`，所有 hook no-op，`sendText` 走原逻辑；接受降级，warn 一次 |

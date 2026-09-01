@@ -149,11 +149,21 @@ export function createTaskCardRegistry(depsIn?: Partial<TaskCardDeps>): TaskCard
   // 编排协议强制在计划末尾放一条不会 spawn 子代理的「汇总结果」，它永远
   // 停在 pending/in_progress。因此完成判定只看真正有子代理绑定的步骤，
   // 未绑定的残留步骤在 finish 时补标完成。
+  // openclaw 在 expectsCompletionMessage 的 spawn 下会把 subagent_ended hook 推迟到 announce
+  // 投递与清理之后（subagent-registry-lifecycle.ts shouldDeferEndedHook），因此主控按协议
+  // 用 update_plan 标出的终态是比 onChildEnded 更早到达的完成信号：子代理未 done 但其绑定
+  // 步骤已 completed/failed，同样视为完成。
+  const isTerminal = (s: TaskStep) => s.status === "completed" || s.status === "failed";
+  const childSettled = (rec: TaskCardRecord, childKey: string, child: TaskChild): boolean => {
+    if (child.done) return true;
+    const bound = rec.steps.find((s) => s.childKey === childKey);
+    return Boolean(bound && isTerminal(bound));
+  };
   const isComplete = (rec: TaskCardRecord): boolean => {
     if (!rec.answer.trim()) return false;
     if (rec.children.size === 0) return false;
-    if (![...rec.children.values()].every((c) => c.done)) return false;
-    return rec.steps.every((s) => !s.childKey || s.status === "completed" || s.status === "failed");
+    if (![...rec.children.entries()].every(([key, c]) => childSettled(rec, key, c))) return false;
+    return rec.steps.every((s) => !s.childKey || isTerminal(s));
   };
 
   const push = async (rec: TaskCardRecord) => {
